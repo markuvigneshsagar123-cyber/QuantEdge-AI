@@ -25,8 +25,10 @@ app.get('/api/stock/:symbol', async (req, res) => {
     let { symbol } = req.params;
     const { period1, period2, range, interval: queryInterval, light } = req.query;
 
-    // Search for ticker if symbol looks like a name
-    if (symbol.includes(' ') || symbol.length > 3) {
+    const isTicker = symbol.startsWith('^') || symbol.endsWith('.NS') || symbol.endsWith('.BO');
+
+    // Search for ticker if symbol looks like a name and isn't already a known ticker format
+    if (!isTicker && (symbol.includes(' ') || symbol.length > 3)) {
       const searchResults = await yahooFinance.search(symbol);
       if (searchResults.quotes && searchResults.quotes.length > 0) {
         const indianQuotes = searchResults.quotes.filter(q => q.exchange === 'NSI' || q.exchange === 'BSE');
@@ -57,13 +59,14 @@ app.get('/api/stock/:symbol', async (req, res) => {
     try {
       quote = await yahooFinance.quote(symbol);
     } catch (e) {
+      console.error(`Quote fetch failed for ${symbol}:`, e);
       const searchResults = await yahooFinance.search(symbol);
       if (searchResults.quotes && searchResults.quotes.length > 0) {
         const bestMatch = searchResults.quotes.find(q => q.exchange === 'NSI' || q.exchange === 'BSE') || searchResults.quotes[0];
         symbol = bestMatch.symbol as string;
         quote = await yahooFinance.quote(symbol);
       } else {
-        throw e;
+        return res.status(404).json({ error: `Stock symbol "${symbol}" not found` });
       }
     }
 
@@ -109,21 +112,29 @@ app.get('/api/stock/:symbol', async (req, res) => {
         p2 = (period2 as string) || p2;
     }
 
-    const result = await yahooFinance.chart(symbol, {
-      period1: p1,
-      period2: p2,
-      interval: fetchInterval as any,
-    });
+    let history: any[] = [];
+    try {
+      const result = await yahooFinance.chart(symbol, {
+        period1: p1,
+        period2: p2,
+        interval: fetchInterval as any,
+      });
 
-    const history = result.quotes.map(q => ({
-      date: q.date,
-      close: q.close,
-      volume: q.volume
-    })).filter(q => q.close !== null && q.close !== undefined);
+      history = result.quotes.map(q => ({
+        date: q.date,
+        close: q.close,
+        volume: q.volume
+      })).filter(q => q.close !== null && q.close !== undefined);
+    } catch (chartError) {
+      console.warn(`Chart fetch failed for ${symbol}:`, chartError);
+      // Fallback: try a simpler chart fetch or just return empty history
+      history = [];
+    }
 
     res.json({ quote, history });
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    console.error('API Error:', error);
+    res.status(500).json({ error: error.message || 'Internal Server Error' });
   }
 });
 

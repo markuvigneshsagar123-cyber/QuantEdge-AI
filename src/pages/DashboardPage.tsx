@@ -68,7 +68,10 @@ export default function DashboardPage() {
     setError(null);
     try {
       const stockRes = await fetch(`/api/stock/${targetSymbol}?range=${range.toLowerCase()}`);
-      if (!stockRes.ok) throw new Error('Stock not found');
+      if (!stockRes.ok) {
+        const errJson = await stockRes.json();
+        throw new Error(errJson.error || 'Stock not found');
+      }
       const stockJson = await stockRes.json();
       setStockData(stockJson);
 
