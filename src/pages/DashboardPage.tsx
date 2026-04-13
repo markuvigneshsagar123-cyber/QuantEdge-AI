@@ -110,14 +110,15 @@ export default function DashboardPage() {
 
   // High-frequency price polling
   useEffect(() => {
-    if (!isLive || !symbol) return;
+    const isMarketOpen = stockData?.quote.marketState === 'REGULAR';
+    if (!isLive || !symbol || !isMarketOpen) return;
 
     const interval = setInterval(() => {
       fetchPriceUpdate(symbol);
     }, 500);
 
     return () => clearInterval(interval);
-  }, [symbol, isLive]);
+  }, [symbol, isLive, stockData?.quote.marketState]);
 
   return (
     <div className="min-h-screen bg-brand-dark text-slate-200 p-4 md:p-8">
