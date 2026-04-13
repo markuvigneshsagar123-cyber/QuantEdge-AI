@@ -12,6 +12,10 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = 3000;
 
+// Simple in-memory cache
+const cache = new Map<string, { data: any; timestamp: number }>();
+const CACHE_TTL = 30 * 1000; // 30 seconds
+
 // @ts-ignore
 const yahooFinance = new YahooFinance();
 
@@ -24,6 +28,12 @@ app.get('/api/stock/:symbol', async (req, res) => {
   try {
     let { symbol } = req.params;
     const { period1, period2, range, interval: queryInterval, light } = req.query;
+
+    const cacheKey = `${symbol}-${range}-${light}`;
+    const cached = cache.get(cacheKey);
+    if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
+      return res.json(cached.data);
+    }
 
     const isTicker = symbol.startsWith('^') || symbol.endsWith('.NS') || symbol.endsWith('.BO');
 
@@ -131,7 +141,10 @@ app.get('/api/stock/:symbol', async (req, res) => {
       history = [];
     }
 
-    res.json({ quote, history });
+    const responseData = { quote, history };
+    cache.set(cacheKey, { data: responseData, timestamp: Date.now() });
+
+    res.json(responseData);
   } catch (error: any) {
     console.error('API Error:', error);
     res.status(500).json({ error: error.message || 'Internal Server Error' });

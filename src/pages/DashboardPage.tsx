@@ -32,9 +32,9 @@ export default function DashboardPage() {
       const stockRes = await fetch(`/api/stock/${targetSymbol}?light=true`);
       if (stockRes.ok) {
         const stockJson = await stockRes.json();
+        setError(null); // Clear error on success
         
         // Add a tiny bit of random noise (0.01%) to simulate real-time tick movement
-        // This makes the 0.5s updates feel "alive" even if the API data is slightly delayed
         const noise = 1 + (Math.random() * 0.0002 - 0.0001);
         const simulatedPrice = stockJson.quote.regularMarketPrice * noise;
         
@@ -51,12 +51,14 @@ export default function DashboardPage() {
           return {
             ...prev,
             quote: updatedQuote,
-            // Update the last history point to reflect the live price
             history: prev.history?.length > 0 
               ? [...prev.history.slice(0, -1), { ...prev.history[prev.history.length - 1], close: simulatedPrice }]
               : prev.history
           };
         });
+      } else if (stockRes.status === 429) {
+        setIsLive(false); // Pause live updates on rate limit
+        setError('Rate limit exceeded. Live updates paused.');
       }
     } catch (err) {
       console.warn('Price update failed', err);
