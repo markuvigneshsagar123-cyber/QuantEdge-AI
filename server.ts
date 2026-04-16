@@ -5,11 +5,20 @@ import { fileURLToPath } from 'url';
 import YahooFinance from 'yahoo-finance2';
 import axios from 'axios';
 import * as cheerio from 'cheerio';
+import { createServer } from 'http';
+import { Server } from 'socket.io';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
+const httpServer = createServer(app);
+const io = new Server(httpServer, {
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST"]
+  }
+});
 const PORT = 3000;
 
 // Simple in-memory cache
@@ -20,6 +29,100 @@ const CACHE_TTL = 30 * 1000; // 30 seconds
 const yahooFinance = new YahooFinance();
 
 app.use(express.json());
+
+// --- WebSocket Logic ---
+const activeSymbols = new Set<string>();
+
+io.on('connection', (socket) => {
+  console.log('Client connected:', socket.id);
+
+  socket.on('subscribe', (symbol: string) => {
+    socket.join(symbol);
+    activeSymbols.add(symbol);
+    console.log(`Client ${socket.id} subscribed to ${symbol}`);
+  });
+
+  socket.on('unsubscribe', (symbol: string) => {
+    socket.leave(symbol);
+    // Check if anyone else is still in the room
+    const room = io.sockets.adapter.rooms.get(symbol);
+    if (!room || room.size === 0) {
+      activeSymbols.delete(symbol);
+    }
+    console.log(`Client ${socket.id} unsubscribed from ${symbol}`);
+  });
+
+  socket.on('disconnect', () => {
+    console.log('Client disconnected:', socket.id);
+    // Cleanup activeSymbols if no one is left in any rooms
+    activeSymbols.forEach(symbol => {
+      const room = io.sockets.adapter.rooms.get(symbol);
+      if (!room || room.size === 0) {
+        activeSymbols.delete(symbol);
+      }
+    });
+  });
+});
+
+// Background polling for prices (every 5 seconds for active symbols)
+setInterval(async () => {
+  if (activeSymbols.size === 0) return;
+
+  for (const symbol of activeSymbols) {
+    try {
+      const quote = await yahooFinance.quote(symbol);
+      if (quote.marketState === 'REGULAR') {
+        io.to(symbol).emit('priceUpdate', {
+          symbol,
+          price: quote.regularMarketPrice,
+          change: quote.regularMarketChange,
+          changePercent: quote.regularMarketChangePercent,
+          time: new Date().toISOString()
+        });
+      }
+    } catch (error) {
+      console.error(`Background price poll failed for ${symbol}:`, error);
+    }
+  }
+}, 5000);
+
+// Background polling for news (every 60 seconds for active symbols)
+setInterval(async () => {
+  if (activeSymbols.size === 0) return;
+
+  for (const symbol of activeSymbols) {
+    try {
+      const ticker = symbol.split('.')[0];
+      const searchUrl = `https://www.google.com/search?q=${ticker}+stock+news+site:economictimes.indiatimes.com+OR+site:moneycontrol.com&tbm=nws`;
+      const response = await axios.get(searchUrl, {
+        headers: { 
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+        },
+        timeout: 5000
+      });
+      const $ = cheerio.load(response.data);
+      const news: any[] = [];
+      
+      $('div.g, div.SoS79, div.nS41Cd, a.WlyYGe').each((i, el) => {
+        if (i < 3) {
+          const title = $(el).find('h3, div[role="heading"]').first().text();
+          const link = $(el).find('a').first().attr('href');
+          const source = $(el).find('.Mg0Zbe, .XT89S, .NUnG9d').first().text() || 'Financial News';
+          
+          if (title && link && link.startsWith('http')) {
+            news.push({ type: 'news', title, link, source, time: 'Just now', category: 'GENERAL' });
+          }
+        }
+      });
+
+      if (news.length > 0) {
+        io.to(symbol).emit('newsUpdate', { symbol, news });
+      }
+    } catch (error) {
+      console.error(`Background news poll failed for ${symbol}:`, error);
+    }
+  }
+}, 60000);
 
 // --- API Routes ---
 
@@ -283,9 +386,10 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`Server running on http://localhost:${PORT}`);
   });
 }
 
 startServer();
+

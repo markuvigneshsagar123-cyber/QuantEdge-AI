@@ -1,7 +1,8 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useSearchParams, useLocation, useNavigate } from 'react-router-dom';
 import { TrendingUp, TrendingDown, Activity, Newspaper, Brain, RefreshCw, BarChart3, ShieldAlert, ArrowLeft, Globe } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
+import { io, Socket } from 'socket.io-client';
 import { formatCurrency, formatNumber, cn } from '../lib/utils';
 import StockChart from '../components/StockChart';
 import SentimentPanel from '../components/SentimentPanel';
@@ -26,63 +27,37 @@ export default function DashboardPage() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [isLive, setIsLive] = useState(true);
-
-  const fetchPriceUpdate = async (targetSymbol: string) => {
-    try {
-      const stockRes = await fetch(`/api/stock/${targetSymbol}?light=true`);
-      if (stockRes.ok) {
-        const stockJson = await stockRes.json();
-        setError(null); // Clear error on success
-        
-        // Add a tiny bit of random noise (0.01%) to simulate real-time tick movement
-        const noise = 1 + (Math.random() * 0.0002 - 0.0001);
-        const simulatedPrice = stockJson.quote.regularMarketPrice * noise;
-        
-        setStockData((prev: any) => {
-          if (!prev) return stockJson;
-          
-          const updatedQuote = {
-            ...stockJson.quote,
-            regularMarketPrice: simulatedPrice,
-            regularMarketChange: simulatedPrice - stockJson.quote.regularMarketOpen,
-            regularMarketChangePercent: ((simulatedPrice - stockJson.quote.regularMarketOpen) / stockJson.quote.regularMarketOpen) * 100
-          };
-
-          return {
-            ...prev,
-            quote: updatedQuote,
-            history: prev.history?.length > 0 
-              ? [...prev.history.slice(0, -1), { ...prev.history[prev.history.length - 1], close: simulatedPrice }]
-              : prev.history
-          };
-        });
-      } else if (stockRes.status === 429) {
-        setIsLive(false); // Pause live updates on rate limit
-        setError('Rate limit exceeded. Live updates paused.');
-      }
-    } catch (err) {
-      console.warn('Price update failed', err);
-    }
-  };
+  const socketRef = useRef<Socket | null>(null);
 
   const fetchData = async (targetSymbol: string, range: string = '1m', isInitial = true) => {
     if (isInitial) setLoading(true);
     setError(null);
     try {
-      const stockRes = await fetch(`/api/stock/${targetSymbol}?range=${range.toLowerCase()}`);
+      const encodedSymbol = encodeURIComponent(targetSymbol);
+      const stockRes = await fetch(`/api/stock/${encodedSymbol}?range=${range.toLowerCase()}`);
+      
       if (!stockRes.ok) {
-        const errJson = await stockRes.json();
-        throw new Error(errJson.error || 'Stock not found');
+        let errorMessage = 'Stock not found';
+        try {
+          const errJson = await stockRes.json();
+          errorMessage = errJson.error || errorMessage;
+        } catch (e) {
+          errorMessage = `Server Error (${stockRes.status}): ${stockRes.statusText || 'Not Found'}`;
+        }
+        throw new Error(errorMessage);
       }
+      
       const stockJson = await stockRes.json();
       setStockData(stockJson);
 
       // Only fetch news and prediction on initial load or symbol change
       if (isInitial || targetSymbol !== stockData?.quote.symbol) {
-        const newsRes = await fetch(`/api/news/${targetSymbol}`);
-        const newsJson = await newsRes.json();
-        setNewsData(newsJson.news);
-        setSocialData(newsJson.social);
+        const newsRes = await fetch(`/api/news/${encodedSymbol}`);
+        if (newsRes.ok) {
+          const newsJson = await newsRes.json();
+          setNewsData(newsJson.news);
+          setSocialData(newsJson.social);
+        }
 
         const mockSentiment = { score: Math.random() * 2 - 1 };
         const predictRes = await fetch('/api/predict', {
@@ -98,8 +73,11 @@ export default function DashboardPage() {
             sentiment: mockSentiment
           })
         });
-        const predictJson = await predictRes.json();
-        setPrediction(predictJson);
+        
+        if (predictRes.ok) {
+          const predictJson = await predictRes.json();
+          setPrediction(predictJson);
+        }
       }
 
     } catch (err: any) {
@@ -113,17 +91,73 @@ export default function DashboardPage() {
     fetchData(symbol, timeframe, true);
   }, [symbol, timeframe]);
 
-  // High-frequency price polling
+  // WebSocket Connection and Streaming
   useEffect(() => {
-    const isMarketOpen = stockData?.quote.marketState === 'REGULAR';
-    if (!isLive || !symbol || !isMarketOpen) return;
+    // Initialize socket
+    const socket = io();
+    socketRef.current = socket;
 
-    const interval = setInterval(() => {
-      fetchPriceUpdate(symbol);
-    }, 500);
+    socket.on('connect', () => {
+      console.log('Connected to WebSocket server');
+      if (isLive && symbol) {
+        socket.emit('subscribe', symbol);
+      }
+    });
 
-    return () => clearInterval(interval);
-  }, [symbol, isLive, stockData?.quote.marketState]);
+    socket.on('priceUpdate', (data) => {
+      if (data.symbol === symbol) {
+        setStockData((prev: any) => {
+          if (!prev) return prev;
+          
+          const updatedQuote = {
+            ...prev.quote,
+            regularMarketPrice: data.price,
+            regularMarketChange: data.change,
+            regularMarketChangePercent: data.changePercent
+          };
+
+          return {
+            ...prev,
+            quote: updatedQuote,
+            history: prev.history?.length > 0 
+              ? [...prev.history.slice(0, -1), { ...prev.history[prev.history.length - 1], close: data.price }]
+              : prev.history
+          };
+        });
+      }
+    });
+
+    socket.on('newsUpdate', (data) => {
+      if (data.symbol === symbol) {
+        setNewsData(prev => {
+          // Add new items to the top and keep unique
+          const combined = [...data.news, ...prev];
+          const unique = Array.from(new Map(combined.map(item => [item.title, item])).values());
+          return unique.slice(0, 10);
+        });
+      }
+    });
+
+    socket.on('error', (err) => {
+      console.error('WebSocket error:', err);
+      setError('Live connection error. Falling back to polling.');
+    });
+
+    return () => {
+      socket.disconnect();
+    };
+  }, [symbol]);
+
+  // Handle Live Toggle
+  useEffect(() => {
+    if (!socketRef.current) return;
+
+    if (isLive) {
+      socketRef.current.emit('subscribe', symbol);
+    } else {
+      socketRef.current.emit('unsubscribe', symbol);
+    }
+  }, [isLive, symbol]);
 
   return (
     <div className="min-h-screen bg-brand-dark text-slate-200 p-4 md:p-8">
